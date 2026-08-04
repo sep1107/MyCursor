@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
-const SEAMLESS_MARKER: &str = "/* __MYCURSOR_SEAMLESS__ */";
+const SEAMLESS_INTEGRITY_MARKER: &str = "/* __MYCURSOR_SEAMLESS_INTEGRITY__ */";
 
 /// 全局服务器状态（与 Tauri 的 State 机制共存）
 static SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -108,12 +108,23 @@ impl SeamlessService {
         let mut content = std::fs::read_to_string(&wp)?;
         let orig_len = content.len();
 
-        // 步骤 1: 绕过完整性检查
+        // 步骤 1: 提前返回，阻止被修改文件的完整性警告弹窗
         let t1 = "_showNotification(){";
-        if content.contains(t1) {
-            content = content.replacen(t1, &format!("_showNotification(){{{}", SEAMLESS_MARKER), 1);
-            details.push("步骤1: 完整性检查绕过 OK".to_string());
+        if !content.contains(t1) {
+            return Err(AppError::Internal(
+                "未找到 _showNotification() 完整性检查锚点，当前 Cursor 版本可能不兼容无感换号"
+                    .to_string(),
+            ));
         }
+        content = content.replacen(
+            t1,
+            &format!(
+                "_showNotification(){{{}return;",
+                SEAMLESS_INTEGRITY_MARKER
+            ),
+            1,
+        );
+        details.push("步骤1: 已禁用文件完整性警告弹窗".to_string());
 
         // 步骤 2: hook AuthService
         let t2 = "addLoginChangedListener(e){this.loginChangedListeners.push(e)}";

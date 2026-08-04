@@ -3,7 +3,63 @@
 /// 涉及 Tauri 窗口创建、Cookie 注入、JavaScript 执行等。
 /// 这些命令需要 `tauri::AppHandle` 参数。
 use crate::{log_info, log_error};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{Emitter, Manager};
+
+const SESSION_COOKIE_NAME: &str = "WorkosCursorSessionToken";
+const SESSION_COOKIE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+static LOGIN_SESSION_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn watch_login_session_cookie(app: tauri::AppHandle, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        let mut cookie_error_logged = false;
+
+        loop {
+            if LOGIN_SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+
+            let Some(window) = app.get_webview_window("login_session") else {
+                let _ = app.emit("session-token-login-closed", serde_json::json!({}));
+                return;
+            };
+
+            match window.cookies() {
+                Ok(cookies) => {
+                    cookie_error_logged = false;
+
+                    if let Some(token) = cookies
+                        .into_iter()
+                        .find(|cookie| cookie.name().eq_ignore_ascii_case(SESSION_COOKIE_NAME))
+                        .map(|cookie| cookie.value().trim().to_string())
+                        .filter(|token| !token.is_empty())
+                    {
+                        if LOGIN_SESSION_GENERATION.load(Ordering::SeqCst) != generation {
+                            return;
+                        }
+
+                        log_info!("登录成功，已获取 WorkOS Session Token");
+                        if let Err(error) = app.emit(
+                            "session-token-obtained",
+                            serde_json::json!({ "token": token }),
+                        ) {
+                            log_error!("发送 Session Token 事件失败: {}", error);
+                        }
+                        let _ = window.close();
+                        return;
+                    }
+                }
+                Err(error) if !cookie_error_logged => {
+                    log_error!("读取登录窗口 Cookie 失败，将继续重试: {}", error);
+                    cookie_error_logged = true;
+                }
+                Err(_) => {}
+            }
+
+            tokio::time::sleep(SESSION_COOKIE_POLL_INTERVAL).await;
+        }
+    });
+}
 
 /// 打开取消订阅页面
 #[tauri::command]
@@ -357,6 +413,13 @@ pub async fn trigger_authorization_login_poll(
 pub async fn open_login_for_session_token(
     app: tauri::AppHandle,
 ) -> Result<serde_json::Value, String> {
+    let generation = LOGIN_SESSION_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    if let Some(window) = app.get_webview_window("login_session") {
+        let _ = window.close();
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
     let _window = tauri::WebviewWindowBuilder::new(
         &app,
         "login_session",
@@ -365,8 +428,11 @@ pub async fn open_login_for_session_token(
     .title("Cursor 登录")
     .inner_size(1200.0, 800.0)
     .center()
+    .incognito(true)
     .build()
     .map_err(|e| e.to_string())?;
+
+    watch_login_session_cookie(app, generation);
 
     Ok(serde_json::json!({"success": true, "message": "已打开登录窗口"}))
 }

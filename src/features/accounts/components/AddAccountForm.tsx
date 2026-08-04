@@ -28,6 +28,14 @@ export const AddAccountForm = memo(({ isOpen, onSuccess, onCancel, onToast }: Ad
   const [parsedMachineIds, setParsedMachineIds] = useState<Record<string, string>>({});
 
   const sessionTokenUnlistenRef = useRef<(() => void) | null>(null);
+  const sessionLoginClosedUnlistenRef = useRef<(() => void) | null>(null);
+
+  const clearSessionLoginListeners = useCallback(() => {
+    sessionTokenUnlistenRef.current?.();
+    sessionTokenUnlistenRef.current = null;
+    sessionLoginClosedUnlistenRef.current?.();
+    sessionLoginClosedUnlistenRef.current = null;
+  }, []);
 
   useEffect(() => {
     if (isOpen) {
@@ -44,19 +52,16 @@ export const AddAccountForm = memo(({ isOpen, onSuccess, onCancel, onToast }: Ad
       setParsedMachineIds({});
     }
 
-    return () => {
-      if (sessionTokenUnlistenRef.current) {
-        sessionTokenUnlistenRef.current();
-        sessionTokenUnlistenRef.current = null;
-      }
-    };
-  }, [isOpen]);
+    return clearSessionLoginListeners;
+  }, [clearSessionLoginListeners, isOpen]);
 
   const handleOpenLoginForSessionToken = useCallback(async () => {
     setFetchingSessionToken(true);
     onToast("正在打开登录页面，请在浏览器中完成登录...", "success");
 
     try {
+      clearSessionLoginListeners();
+
       const unlisten = await listen<{ token: string }>("session-token-obtained", (event) => {
         const token = event.payload?.token;
         if (token) {
@@ -64,16 +69,24 @@ export const AddAccountForm = memo(({ isOpen, onSuccess, onCancel, onToast }: Ad
           onToast("SessionToken 获取成功！", "success");
         }
         setFetchingSessionToken(false);
+        clearSessionLoginListeners();
       });
       sessionTokenUnlistenRef.current = unlisten;
+
+      const unlistenClosed = await listen("session-token-login-closed", () => {
+        setFetchingSessionToken(false);
+        clearSessionLoginListeners();
+      });
+      sessionLoginClosedUnlistenRef.current = unlistenClosed;
 
       await invoke("open_login_for_session_token");
     } catch (error) {
       console.error("打开登录窗口失败:", error);
       onToast("打开登录窗口失败", "error");
       setFetchingSessionToken(false);
+      clearSessionLoginListeners();
     }
-  }, [onToast]);
+  }, [clearSessionLoginListeners, onToast]);
 
   const getClientAccessToken = useCallback(async (sessionToken: string) => {
     try {
