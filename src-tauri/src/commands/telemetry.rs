@@ -20,7 +20,8 @@ fn regex_anysphere_main_js_hash() -> &'static Regex {
     })
 }
 
-const TELEMETRY_MARKER: &str = "/* __MYCURSOR_TELEMETRY_PATCH__ */";
+const TELEMETRY_PROXY_MARKER: &str = "/* __MYCURSOR_TELEMETRY_PATCH__ */";
+const TELEMETRY_STRUCTURED_LOG_MARKER: &str = "/* __MYCURSOR_STRUCTURED_LOG_PATCH__ */";
 const TELEMETRY_MAIN_BACKUP_SUFFIX: &str = ".backup.telemetry";
 const TELEMETRY_HOST_BACKUP_SUFFIX: &str = ".backup.telemetry";
 
@@ -85,10 +86,10 @@ impl TelemetryPatcher {
         format!("{:x}", Sha256::digest(bytes))
     }
 
-    /// 与 patch-cursor-telemetry 一致：补丁注释或 Analytics 拦截字符串
+    /// 完整补丁必须同时覆盖新版独立 StructuredLog transport 和 AI proxy。
     fn main_looks_patched(main: &str) -> bool {
-        main.contains(TELEMETRY_MARKER)
-            || main.contains("\"aiserver.v1.AnalyticsService\"===t.typeName")
+        main.contains(TELEMETRY_STRUCTURED_LOG_MARKER)
+            && main.contains(TELEMETRY_PROXY_MARKER)
     }
 
     /// 从宿主哈希表中读出 cursor-always-local main.js 的 SHA256（优先 upstream 正则）
@@ -118,9 +119,18 @@ impl TelemetryPatcher {
             let main_content = std::fs::read_to_string(&main_path)?;
             let host_content = std::fs::read_to_string(&host_path)?;
             let main_patched = Self::main_looks_patched(&main_content);
+            if !main_content.contains(TELEMETRY_STRUCTURED_LOG_MARKER) {
+                details.push("新版 StructuredLogProviderImpl._submitLogs 尚未拦截".to_string());
+            }
+            if !main_content.contains(TELEMETRY_PROXY_MARKER) {
+                details.push("AI Service 遥测 proxy 尚未拦截".to_string());
+            }
             let main_hash = Self::sha256_hex_static(main_content.as_bytes());
             let host_reports_same_hash =
                 Self::extract_main_js_hash_from_host(&host_content).as_deref() == Some(main_hash.as_str());
+            if !host_reports_same_hash {
+                details.push("extensionHostProcess.js 中的扩展完整性哈希不匹配".to_string());
+            }
             main_patched && host_reports_same_hash
         } else {
             false
@@ -161,14 +171,27 @@ impl TelemetryPatcher {
             details.push(format!("已备份宿主文件: {}", host_backup.display()));
         }
 
-        // 扩展无补丁则先写入 main；宿主必须始终与当前 main 的 SHA256 一致并带补丁标记，
-        // 否则会出现「扩展已补丁、宿主仍原味」的中间态，表现为状态一直「未应用」。
+        // 新版 StructuredLogProviderImpl 使用独立 createConnectTransport 直连 AnalyticsService，
+        // 不经过 createMultiProxyTransport，因此必须单独拦截 _submitLogs。
         let mut main_content = std::fs::read_to_string(&main_path)?;
-        if !Self::main_looks_patched(&main_content) {
-            let patched_main = self.patch_extension_main(&main_content)?;
-            std::fs::write(&main_path, &patched_main)?;
-            details.push("已写入遥测拦截逻辑到 cursor-always-local/main.js".to_string());
-            main_content = patched_main;
+        let mut main_changed = false;
+
+        if !main_content.contains(TELEMETRY_STRUCTURED_LOG_MARKER) {
+            main_content = self.patch_structured_log_upload(&main_content)?;
+            main_changed = true;
+            details.push("已拦截 StructuredLogProviderImpl._submitLogs".to_string());
+        }
+
+        if !main_content.contains(TELEMETRY_PROXY_MARKER) {
+            main_content = self.patch_ai_telemetry_proxy(&main_content)?;
+            main_changed = true;
+            details.push("已拦截 AnalyticsService 与 AI Service 遥测 proxy".to_string());
+        }
+
+        if main_changed {
+            std::fs::write(&main_path, &main_content)?;
+        } else {
+            details.push("扩展遥测拦截点已存在，无需重复写入".to_string());
         }
 
         let hash = self.sha256_hex(main_content.as_bytes());
@@ -243,8 +266,36 @@ impl TelemetryPatcher {
         Ok(std::path::PathBuf::from(format!("{}{}", host_path.to_string_lossy(), TELEMETRY_HOST_BACKUP_SUFFIX)))
     }
 
-    /// 优先使用与 <https://github.com/lyon-le/patch-cursor-telemetry> 相同的包装层注入
-    fn patch_extension_main(&self, content: &str) -> Result<String, crate::error::AppError> {
+    /// 新版 Cursor 的结构化日志使用独立 AnalyticsService transport，直接阻止 SubmitLogs。
+    fn patch_structured_log_upload(&self, content: &str) -> Result<String, crate::error::AppError> {
+        let re = Regex::new(r"_submitLogs\([a-zA-Z_$][a-zA-Z0-9_$]*\)\{")
+            .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+        let mut matches = re.find_iter(content);
+        let matched = matches.next().ok_or_else(|| {
+            crate::error::AppError::Internal(
+                "未找到 StructuredLogProviderImpl._submitLogs，当前 Cursor 版本可能已改变遥测实现"
+                    .to_string(),
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(crate::error::AppError::Internal(
+                "检测到多个 _submitLogs 锚点，拒绝在不明确的位置应用遥测补丁".to_string(),
+            ));
+        }
+
+        let injection = format!(
+            "{}return Promise.resolve();",
+            TELEMETRY_STRUCTURED_LOG_MARKER
+        );
+        let mut patched = String::with_capacity(content.len() + injection.len());
+        patched.push_str(&content[..matched.end()]);
+        patched.push_str(&injection);
+        patched.push_str(&content[matched.end()..]);
+        Ok(patched)
+    }
+
+    /// 保留 multi-proxy 注入，用于拦截 AI Service 中的部分遥测方法。
+    fn patch_ai_telemetry_proxy(&self, content: &str) -> Result<String, crate::error::AppError> {
         if let Some(p) = Self::patch_extension_main_upstream(content) {
             return Ok(p);
         }
@@ -357,10 +408,10 @@ try {
 
         let replaced = content.replacen(&old_hash, new_hash, 1);
         if replaced != content {
-            return Ok(if content.contains(TELEMETRY_MARKER) {
+            return Ok(if content.contains(TELEMETRY_PROXY_MARKER) {
                 replaced
             } else {
-                format!("{}\n{}", TELEMETRY_MARKER, replaced)
+                format!("{}\n{}", TELEMETRY_PROXY_MARKER, replaced)
             });
         }
 
