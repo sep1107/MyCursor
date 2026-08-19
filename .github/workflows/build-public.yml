@@ -82,6 +82,10 @@ jobs:
       - name: Build
         run: npm run tauri:build
 
+      - name: Verify macOS app signature
+        if: matrix.platform.os == 'macos-latest'
+        run: codesign --verify --deep --strict --verbose=2 src-tauri/target/release/bundle/macos/MyCursor.app
+
       - name: Rename artifacts (remove version from filenames)
         shell: bash
         run: |
